@@ -1,7 +1,0 @@
-{
-  "board": "NUCLEO-G071RB",
-  "device": "STM32G071RBT6",
-  "toolchain": "GCC",
-  "core": "Cortex-M0+",
-  "order": 0
-}
