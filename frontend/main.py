@@ -1,166 +1,248 @@
+import sys
+import struct
 import serial
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from collections import deque
+import pyqtgraph as pg
 
-# -----------------------
+from serial.tools import list_ports
+from pyqtgraph.Qt import QtCore, QtWidgets
+
+# =======================
 # Configuration
-# -----------------------
-MAX_FREQ = 30000.0
-HISTORY_LENGTH = 50
+# =======================
+PACKET_FORMAT = "<Iffff128f"
+PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
+SYNC_WORD = 0xABCDEFFF
+
+BAUDRATE = 921600
+SERIAL_TIMEOUT = 0.1
+
 SAMPLE_FREQ = 44138
-FFT_BUFF = 128
-SAMPLES_PER_SEND = 256 
-X_MS_PER_POINT = (1000.0 * SAMPLES_PER_SEND) / SAMPLE_FREQ
-print(X_MS_PER_POINT)
-# -----------------------
-# Serial setup (OPEN ONCE)
-# -----------------------
-ser = serial.Serial(
-    port='COM8',          # change if needed
-    baudrate=115200,
-    timeout=1
-)
+FFT_SIZE = 128
+NUM_BINS = FFT_SIZE // 2
 
-# -----------------------
-# Data buffers
-# -----------------------
-freq_history = deque(maxlen=HISTORY_LENGTH)
-xy_history_y = deque(maxlen=HISTORY_LENGTH)
+MAX_FREQ = 20_000.0
+RADIUS = 1.0
+NUM_FREQ_TICKS = 12
+NOISE_FLOOR = 0.05
 
-# -----------------------
-# Figure & axes
-# -----------------------
-fig = plt.figure(figsize=(11, 5))
 
-ax_xy = fig.add_subplot(1, 2, 1)
-ax_polar = fig.add_subplot(1, 2, 2, projection='polar')
-
-# -----------------------
-# XY plot setup
-# -----------------------
-ax_xy.set_title("Basic X-Y Plot")
-ax_xy.set_ylim(0, 1)
-ax_xy.set_xlim(0, HISTORY_LENGTH)
-
-xy_line, = ax_xy.plot([], [], lw=2)
-
-# -----------------------
-# Polar plot setup
-# -----------------------
-ax_polar.set_title("Frequency History (Hz)")
-ax_polar.set_rlim(0, 1)
-
-# Frequency ticks instead of degrees
-freq_ticks = np.linspace(0, MAX_FREQ, 6)
-angle_ticks = (freq_ticks / MAX_FREQ) * 2 * np.pi
-ax_polar.set_thetagrids(angle_ticks * 180 / np.pi,
-                        labels=[f"{int(f)} Hz" for f in freq_ticks])
-
-polar_lines = []
-
-# -----------------------
-# Read serial data
-# -----------------------
-def read_signal_data():
-    try:
-        line = ser.readline().decode('utf-8').strip()
-        if not line:
-            return None
-
-        parts = line.split(',')
-
-        data = {
-            "total_energy": float(parts[0]),
-            "average_energy": float(parts[1]),
-            "current_rms": float(parts[2]),
-            "top_bins": [
-                int(parts[3]),
-                int(parts[4]),
-                int(parts[5])
-            ],
-            "current_avg_voltage": float(parts[6])
-        }
-
-        return data
-
-    except (ValueError, IndexError) as e:
-        print("Parse error:", e, "Line:", line)
+# =======================
+# Serial Port Selection
+# =======================
+def select_serial_port():
+    ports = list_ports.comports()
+    if not ports:
+        QtWidgets.QMessageBox.critical(
+            None, "No Serial Ports", "No serial ports were found."
+        )
         return None
 
-def bin_to_freq(bin_val):
-    global SAMPLE_FREQ
-    global FFT_BUFF
-    return (bin_val*SAMPLE_FREQ)/FFT_BUFF
+    dialog = QtWidgets.QDialog()
+    dialog.setWindowTitle("Select Serial Port")
+    layout = QtWidgets.QVBoxLayout(dialog)
 
-# -----------------------
-# Animation update
-# -----------------------
-def update(frame):
-    data = read_signal_data()
-    if data is None:
-        return []
+    combo = QtWidgets.QComboBox()
+    for p in ports:
+        combo.addItem(f"{p.device} — {p.description}", p.device)
 
-    # --- Add new data ---
-    for f in data["top_bins"]:
-        freq_history.append(bin_to_freq(f))
-        #print(bin_to_freq(f))
+    layout.addWidget(QtWidgets.QLabel("Select a serial port:"))
+    layout.addWidget(combo)
 
-    xy_history_y.append(data["current_avg_voltage"])
-    print(data["current_avg_voltage"])
-
-    # -----------------------
-    # XY LINE (with fade)
-    # -----------------------
-    ax_xy.cla()
-    ax_xy.set_title("Basic X-Y Plot")
-    ax_xy.set_ylim(0, 1)
-    ax_xy.set_xlim(0, HISTORY_LENGTH)
-
-    y_vals = list(xy_history_y)
-    x_vals = np.arange(len(y_vals)) * X_MS_PER_POINT
-
-    for i in range(len(x_vals) - 1):
-        alpha = (i + 1) / len(x_vals)
-        ax_xy.plot(
-            x_vals[i:i+2],
-            y_vals[i:i+2],
-            color=(0, 0, 1, alpha),
-            lw=2
-        )
-
-    # -----------------------
-    # POLAR LINE (with fade)
-    # -----------------------
-    ax_polar.cla()
-    ax_polar.set_title("Frequency History (Hz)")
-    ax_polar.set_rlim(0, 1)
-
-    ax_polar.set_thetagrids(
-        angle_ticks * 180 / np.pi,
-        labels=[f"{int(f)} Hz" for f in freq_ticks]
+    buttons = QtWidgets.QDialogButtonBox(
+        QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
     )
+    layout.addWidget(buttons)
 
-    freqs = list(freq_history)
-    angles = [(f / MAX_FREQ) * 2 * np.pi for f in freqs]
-    radii = np.ones(len(angles))
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
 
-    for i in range(len(angles) - 1):
-        alpha = (i + 1) / len(angles)
-        ax_polar.plot(
-            angles[i:i+2],
-            radii[i:i+2],
-            color=(1, 0, 0, alpha),
-            lw=2
+    return combo.currentData() if dialog.exec() else None
+
+
+# =======================
+# DSP Helpers
+# =======================
+def reconstruct_signal(fft_half):
+    """Rebuild time-domain signal from half FFT"""
+    full_fft = np.zeros(FFT_SIZE, dtype=complex)
+    full_fft[:NUM_BINS] = fft_half
+    full_fft[NUM_BINS + 1:] = np.conj(fft_half[1:][::-1])
+
+    adc = np.fft.ifft(full_fft).real + 2048.0
+    return adc * (3.3 / 4095.0)
+
+
+# =======================
+# Main Application
+# =======================
+class SignalAnalyzerApp(QtWidgets.QWidget):
+    def __init__(self, serial_port):
+        super().__init__()
+
+        self.ser = serial.Serial(
+            port=serial_port,
+            baudrate=BAUDRATE,
+            timeout=SERIAL_TIMEOUT
+        )
+        self.ser.flushInput()
+
+        self._init_frequency_mapping()
+        self._init_ui()
+        self._init_timer()
+
+    # ---------- Init ----------
+    def _init_frequency_mapping(self):
+        self.bin_freqs = np.linspace(0, SAMPLE_FREQ / 2, NUM_BINS)
+        self.valid_idx = np.where(
+            (self.bin_freqs > 100) &
+            (self.bin_freqs < (MAX_FREQ - 100))
+        )[0]
+
+        self.active_freqs = self.bin_freqs[self.valid_idx]
+        self.radial_angles = (self.active_freqs / MAX_FREQ) * 2 * np.pi
+
+    def _init_ui(self):
+        pg.setConfigOptions(antialias=True)
+
+        self.win = pg.GraphicsLayoutWidget(title="Signal Analyzer")
+        self.win.resize(1200, 800)
+        self.win.show()
+
+        self.hud = self.win.addLabel(size='12pt')
+        self.win.nextRow()
+
+        # Waveform
+        self.wave_plot = self.win.addPlot(title="Waveform (Voltage)")
+        self.wave_curve = self.wave_plot.plot(pen='g')
+
+        # Radial Spectrum
+        self.radial_plot = self.win.addPlot(title="Radial Spectrum (Hz)")
+        self.radial_plot.setAspectLocked()
+        self.radial_plot.hideAxis('bottom')
+        self.radial_plot.hideAxis('left')
+
+        self.radial_plot.addItem(
+            QtWidgets.QGraphicsEllipseItem(
+                -RADIUS, -RADIUS, RADIUS * 2, RADIUS * 2
+            )
         )
 
-    return []
+        self.radial_spokes = self.radial_plot.plot(
+            pen=pg.mkPen('r', width=1.5), connect='pairs'
+        )
 
-# -----------------------
-# Run animation
-# -----------------------
-ani = FuncAnimation(fig, update, interval=200)
+        self._add_radial_labels()
 
-plt.tight_layout()
-plt.show()
+        self.win.nextRow()
+
+        # Spectrum
+        self.spec_plot = self.win.addPlot(title="Power Spectrum (dB)")
+        self.spec_curve = self.spec_plot.plot(pen='y')
+        self.spec_plot.setYRange(-20, 100)
+
+    def _add_radial_labels(self):
+        for f in np.linspace(0, MAX_FREQ, NUM_FREQ_TICKS):
+            angle = (f / MAX_FREQ) * 2 * np.pi
+            label = pg.TextItem(f"{int(f / 1000)}k", anchor=(0.5, 0.5))
+            label.setPos(
+                1.15 * RADIUS * np.cos(angle),
+                1.15 * RADIUS * np.sin(angle)
+            )
+            self.radial_plot.addItem(label)
+
+    def _init_timer(self):
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update)
+        self.timer.start(30)
+
+    # ---------- Serial ----------
+    def read_packet(self):
+        if self.ser.in_waiting < PACKET_SIZE:
+            return None
+
+        raw = self.ser.read(self.ser.in_waiting)
+        sync = struct.pack("<I", SYNC_WORD)
+        idx = raw.rfind(sync)
+
+        if idx == -1 or len(raw[idx:]) < PACKET_SIZE:
+            return None
+
+        packet = raw[idx:idx + PACKET_SIZE]
+        try:
+            unpacked = struct.unpack(PACKET_FORMAT, packet)
+        except struct.error:
+            return None
+
+        real = np.array(unpacked[5:69])
+        imag = np.array(unpacked[69:133])
+        fft = real + 1j * imag
+
+        return {
+            "energy": unpacked[1],
+            "avg_energy": unpacked[2],
+            "rms": unpacked[3],
+            "avg_v": unpacked[4],
+            "fft": fft,
+            "mags": np.abs(fft)
+        }
+
+    # ---------- Update ----------
+    def update(self):
+        data = self.read_packet()
+        if not data:
+            return
+
+        mags = data["mags"][:NUM_BINS]
+
+        self.spec_curve.setData(
+            self.bin_freqs,
+            20 * np.log10(mags + 1e-9)
+        )
+
+        self.wave_curve.setData(
+            reconstruct_signal(data["fft"])
+        )
+
+        self._update_radial(mags)
+        self._update_hud(data, mags)
+
+    def _update_radial(self, mags):
+        mags_f = mags[self.valid_idx]
+        mags_f[mags_f < NOISE_FLOOR] = 0
+
+        scale = np.max(mags_f) or 1.0
+        lengths = (mags_f / scale) * RADIUS
+
+        pts_x = np.zeros(len(lengths) * 2)
+        pts_y = np.zeros(len(lengths) * 2)
+
+        pts_x[1::2] = np.cos(self.radial_angles) * lengths
+        pts_y[1::2] = np.sin(self.radial_angles) * lengths
+
+        self.radial_spokes.setData(pts_x, pts_y)
+
+    def _update_hud(self, data, mags):
+        peak_bin = np.argmax(mags[1:]) + 1
+        peak_hz = peak_bin * SAMPLE_FREQ / FFT_SIZE
+
+        self.hud.setText(
+            f"Energy: {data['energy']:.2f}J | "
+            f"Avg Energy: {data['avg_energy']:.2f}J | "
+            f"RMS: {data['rms']:.3f}V | "
+            f"Peak: {peak_hz:.1f}Hz"
+        )
+
+
+# =======================
+# Entry Point
+# =======================
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+
+    port = select_serial_port()
+    if not port:
+        sys.exit(0)
+
+    analyzer = SignalAnalyzerApp(port)
+    sys.exit(app.exec())
