@@ -62,8 +62,12 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+#define CALCULATE_EVERY_MS 10
+int energy_array[CALCULATE_EVERY_MS];
+
 uint16_t adc_value;
 char tx_buffer[32];
+uint32_t last_time = 0;
 /* USER CODE END 0 */
 
 /**
@@ -347,19 +351,26 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-  if (hadc->Instance == ADC1)
-  {
-    adc_value = HAL_ADC_GetValue(hadc);
+    uint32_t current_time = HAL_GetTick();
+    if (hadc->Instance == ADC1)
+    {
+        adc_value = HAL_ADC_GetValue(hadc);
+         // get current time in ms
+        int len = snprintf(tx_buffer, sizeof(tx_buffer),
+                           "Time: %lu ms, ADC: %u\r\n", current_time, adc_value);
 
-    int len = snprintf(tx_buffer, sizeof(tx_buffer),
-                       "%u\r\n", adc_value);
+        HAL_UART_Transmit(&huart2,
+                          (uint8_t *)tx_buffer,
+                          len,
+                          HAL_MAX_DELAY);
+    }
+    if (current_time > last_time+10)
+    {
 
-    HAL_UART_Transmit(&huart2,
-                      (uint8_t *)tx_buffer,
-                      len,
-                      HAL_MAX_DELAY);
-  }
+    }
+
 }
+
 
 /* USER CODE END 4 */
 

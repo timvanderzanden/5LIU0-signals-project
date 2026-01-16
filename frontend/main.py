@@ -1,115 +1,166 @@
-import matplotlib.pyplot as plt
-import numpy as np
-import time
 import serial
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 from collections import deque
-import struct
 
-# ---------- Configuration ----------
-PORT = "COM8"
-BAUDRATE = 115200
-TIMEOUT = 0.1
-WINDOW_SIZE = 500  # Number of points visible on x-axis
-FIG_SIZE = (10, 5)  # Width, Height in inches
+# -----------------------
+# Configuration
+# -----------------------
+MAX_FREQ = 30000.0
+HISTORY_LENGTH = 50
+SAMPLE_FREQ = 44138
+FFT_BUFF = 128
+SAMPLES_PER_SEND = 256 
+X_MS_PER_POINT = (1000.0 * SAMPLES_PER_SEND) / SAMPLE_FREQ
+print(X_MS_PER_POINT)
+# -----------------------
+# Serial setup (OPEN ONCE)
+# -----------------------
+ser = serial.Serial(
+    port='COM8',          # change if needed
+    baudrate=115200,
+    timeout=1
+)
 
-plt.ion()
-fig, ax = plt.subplots(figsize=FIG_SIZE)
+# -----------------------
+# Data buffers
+# -----------------------
+freq_history = deque(maxlen=HISTORY_LENGTH)
+xy_history_y = deque(maxlen=HISTORY_LENGTH)
 
-# Using deque for efficient fixed-size scrolling window
-x = deque(maxlen=WINDOW_SIZE)
-y = deque(maxlen=WINDOW_SIZE)
-line, = ax.plot([], [])
+# -----------------------
+# Figure & axes
+# -----------------------
+fig = plt.figure(figsize=(11, 5))
 
-ax.set_xlabel("Time (ms)")
-ax.set_ylabel("Voltage")
-ax.set_title("Real-Time Voltage Plot")
+ax_xy = fig.add_subplot(1, 2, 1)
+ax_polar = fig.add_subplot(1, 2, 2, projection='polar')
 
-lifetime_energy = 0
+# -----------------------
+# XY plot setup
+# -----------------------
+ax_xy.set_title("Basic X-Y Plot")
+ax_xy.set_ylim(0, 1)
+ax_xy.set_xlim(0, HISTORY_LENGTH)
 
+xy_line, = ax_xy.plot([], [], lw=2)
 
-def read_serial_string(port=PORT, baudrate=BAUDRATE, timeout=TIMEOUT):
+# -----------------------
+# Polar plot setup
+# -----------------------
+ax_polar.set_title("Frequency History (Hz)")
+ax_polar.set_rlim(0, 1)
+
+# Frequency ticks instead of degrees
+freq_ticks = np.linspace(0, MAX_FREQ, 6)
+angle_ticks = (freq_ticks / MAX_FREQ) * 2 * np.pi
+ax_polar.set_thetagrids(angle_ticks * 180 / np.pi,
+                        labels=[f"{int(f)} Hz" for f in freq_ticks])
+
+polar_lines = []
+
+# -----------------------
+# Read serial data
+# -----------------------
+def read_signal_data():
     try:
-        with serial.Serial(port, baudrate, timeout=timeout) as ser:
-            buffer = ""
-            while True:
-                chunk = ser.read(ser.in_waiting or 1).decode('utf-8', errors='ignore')
-                if chunk:
-                    buffer += chunk
-                    if '\n' in buffer:
-                        line_str, buffer = buffer.split('\n', 1)
-                        return line_str.strip()
-    except serial.SerialException as e:
-        print("Serial error:", e)
+        line = ser.readline().decode('utf-8').strip()
+        if not line:
+            return None
+
+        parts = line.split(',')
+
+        data = {
+            "total_energy": float(parts[0]),
+            "average_energy": float(parts[1]),
+            "current_rms": float(parts[2]),
+            "top_bins": [
+                int(parts[3]),
+                int(parts[4]),
+                int(parts[5])
+            ],
+            "current_avg_voltage": float(parts[6])
+        }
+
+        return data
+
+    except (ValueError, IndexError) as e:
+        print("Parse error:", e, "Line:", line)
         return None
 
-HEADER = b'\xAA\x55'
-PACKET_SIZE = 14  # 2 bytes header + 12 bytes payload
+def bin_to_freq(bin_val):
+    global SAMPLE_FREQ
+    global FFT_BUFF
+    return (bin_val*SAMPLE_FREQ)/FFT_BUFF
 
-def read_binary_packet(ser = serial.Serial(PORT, BAUDRATE, timeout=TIMEOUT)):
-    while True:
-        # Step 1: find the header
-        byte = ser.read(1)
-        if byte == HEADER[:1]:
-            second = ser.read(1)
-            if second == HEADER[1:2]:
-                # Step 2: read the payload (12 bytes)
-                payload = ser.read(12)
-                if len(payload) == 12:
-                    # Step 3: unpack payload: time1, voltage1, time2, voltage2
-                    time1, voltage1, time2, voltage2 = struct.unpack('<IHIH', payload)
-                    return time1, voltage1, time2, voltage2
+# -----------------------
+# Animation update
+# -----------------------
+def update(frame):
+    data = read_signal_data()
+    if data is None:
+        return []
 
+    # --- Add new data ---
+    for f in data["top_bins"]:
+        freq_history.append(bin_to_freq(f))
+        #print(bin_to_freq(f))
 
+    xy_history_y.append(data["current_avg_voltage"])
+    print(data["current_avg_voltage"])
 
-def get_new_signal_values():
-    global lifetime_energy
-    '''
-    global lifetime_energy
-    string_data = read_serial_string()
-    if string_data is None:
-        return None
+    # -----------------------
+    # XY LINE (with fade)
+    # -----------------------
+    ax_xy.cla()
+    ax_xy.set_title("Basic X-Y Plot")
+    ax_xy.set_ylim(0, 1)
+    ax_xy.set_xlim(0, HISTORY_LENGTH)
 
-    data_array = string_data.split(";")
-    if len(data_array) != 5:
-        return None
-    if data_array[0] != "?":
-        return None
-    '''
-    data_array = read_binary_packet()
+    y_vals = list(xy_history_y)
+    x_vals = np.arange(len(y_vals)) * X_MS_PER_POINT
 
-    try:
-        time_stamp = int(data_array[0])
-        current_voltage = int(data_array[1])
-        rms_voltage = int(data_array[2])
-        short_time_energy = int(data_array[3])
-        lifetime_energy += short_time_energy
-        return time_stamp, current_voltage, rms_voltage, short_time_energy, lifetime_energy
-    except ValueError:
-        return None
+    for i in range(len(x_vals) - 1):
+        alpha = (i + 1) / len(x_vals)
+        ax_xy.plot(
+            x_vals[i:i+2],
+            y_vals[i:i+2],
+            color=(0, 0, 1, alpha),
+            lw=2
+        )
 
+    # -----------------------
+    # POLAR LINE (with fade)
+    # -----------------------
+    ax_polar.cla()
+    ax_polar.set_title("Frequency History (Hz)")
+    ax_polar.set_rlim(0, 1)
 
-while True:
-    if not plt.fignum_exists(fig.number):
-        break
+    ax_polar.set_thetagrids(
+        angle_ticks * 180 / np.pi,
+        labels=[f"{int(f)} Hz" for f in freq_ticks]
+    )
 
-    signal_values = get_new_signal_values()
-    if signal_values is None:
-        continue
+    freqs = list(freq_history)
+    angles = [(f / MAX_FREQ) * 2 * np.pi for f in freqs]
+    radii = np.ones(len(angles))
 
-    time_stamp, current_voltage, rms_voltage, short_time_energy, lifetime_energy = signal_values
+    for i in range(len(angles) - 1):
+        alpha = (i + 1) / len(angles)
+        ax_polar.plot(
+            angles[i:i+2],
+            radii[i:i+2],
+            color=(1, 0, 0, alpha),
+            lw=2
+        )
 
-    x.append(time_stamp)
-    y.append(current_voltage)
+    return []
 
-    line.set_xdata(x)
-    line.set_ydata(y)
+# -----------------------
+# Run animation
+# -----------------------
+ani = FuncAnimation(fig, update, interval=200)
 
-    # Adjust x-axis to show only the last WINDOW_SIZE points
-    if len(x) > 1:
-        ax.set_xlim(x[0], x[-1])
-        ax.set_ylim(min(y) - 10, max(y) + 10)  # Add small margin
-
-    plt.draw()
-    plt.pause(0.01)
-
-print("Plot closed. Exiting cleanly.")
+plt.tight_layout()
+plt.show()
